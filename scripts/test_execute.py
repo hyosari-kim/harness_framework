@@ -577,7 +577,24 @@ class TestRunReviews:
         cmd = mock_run.call_args_list[0][0][0]
         assert cmd[0] == "claude"
         assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
+
+    def test_review_sessions_are_restricted(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("VERDICT: PASS"), _claude_result("")]) as mock_run:
+            executor._run_reviews()
+
+        for call in mock_run.call_args_list:
+            cmd = call[0][0]
+            arg = lambda flag: cmd[cmd.index(flag) + 1]
+            assert "--dangerously-skip-permissions" not in cmd
+            # 쓸 수 있는 내장 도구 자체를 읽기와 Bash로 줄인다(Edit·Write 없음)
+            assert set(arg("--tools").split(",")) == {"Read", "Grep", "Glob", "Bash"}
+            # Bash는 허용 목록만 확인 없이 실행하고, 나머지는 묻지 않고 거부한다
+            allowed = arg("--allowedTools").split(",")
+            assert "Bash(git diff:*)" in allowed and "Bash(npm run:*)" in allowed
+            assert not any(t.startswith("Bash(git push") or t == "Bash" for t in allowed)
+            assert arg("--permission-mode") == "dontAsk"
+            # 사용자 설정의 넓은 허용(Bash(*), Edit 등)과 auto 모드를 들이지 않는다
+            assert arg("--setting-sources") == "project"
 
     def test_saves_outputs(self, executor):
         with patch("subprocess.run", side_effect=[_claude_result("✅ 통과"), _claude_result("지적 1")]):

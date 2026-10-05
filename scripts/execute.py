@@ -61,6 +61,15 @@ class StepExecutor:
     CHORE_MSG = "chore({phase}): step {num} output"
     # (출력 파일 이름, 프롬프트). /code-review는 claude -p에서 리뷰를 하지 않아 프로젝트 커맨드를 쓴다.
     REVIEWS = (("review", "/review"), ("logic-review", "/logic-review"))
+    # 리뷰 세션은 권한 확인을 끄지 않는다. 쓸 수 있는 도구를 읽기와 Bash로 줄이고(--tools),
+    # Bash는 git 조회·npm 검증 명령만 허용하며 나머지는 묻지 않고 거부한다(dontAsk).
+    # 사용자 설정의 넓은 허용(Bash(*), Edit 등)이 들어오지 않게 프로젝트 설정만 읽는다.
+    REVIEW_TOOLS = ("Read", "Grep", "Glob", "Bash")
+    REVIEW_ALLOWED = (
+        "Read", "Grep", "Glob",
+        "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)", "Bash(git show:*)",
+        "Bash(npm run:*)",
+    )
     TZ = timezone(timedelta(hours=9))
 
     def __init__(self, phase_dir_name: str, *, auto_push: bool = False, auto_review: bool = False):
@@ -275,7 +284,12 @@ class StepExecutor:
         for name, prompt in self.REVIEWS:
             with progress_indicator(f"{prompt} 실행 중"):
                 result = subprocess.run(
-                    ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+                    ["claude", "-p",
+                     "--tools", ",".join(self.REVIEW_TOOLS),
+                     "--allowedTools", ",".join(self.REVIEW_ALLOWED),
+                     "--permission-mode", "dontAsk",
+                     "--setting-sources", "project",
+                     "--output-format", "json", prompt],
                     cwd=self._root, capture_output=True, text=True, timeout=1800,
                 )
             try:
