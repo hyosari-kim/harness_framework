@@ -557,3 +557,124 @@ class TestCheckBlockers:
         with pytest.raises(SystemExit) as exc_info:
             inst._check_blockers()
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# --review: phase 완료 뒤 /review(규칙) → /logic-review(로직) 실행
+# ---------------------------------------------------------------------------
+
+def _claude_result(text, returncode=0):
+    return MagicMock(returncode=returncode, stdout=json.dumps({"result": text}), stderr="")
+
+
+class TestRunReviews:
+    def test_runs_review_then_logic_review(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("VERDICT: PASS"), _claude_result("버그 없음")]) as mock_run:
+            executor._run_reviews()
+
+        prompts = [c[0][0][-1] for c in mock_run.call_args_list]
+        assert prompts == ["/review", "/logic-review"]
+        cmd = mock_run.call_args_list[0][0][0]
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "--dangerously-skip-permissions" in cmd
+
+    def test_saves_outputs(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("✅ 통과"), _claude_result("지적 1")]):
+            executor._run_reviews()
+
+        review = json.loads((executor._phase_dir / "review-output.json").read_text())
+        logic = json.loads((executor._phase_dir / "logic-review-output.json").read_text())
+        assert review["command"] == "/review"
+        assert review["exitCode"] == 0
+        assert review["result"] == "✅ 통과"
+        assert logic["result"] == "지적 1"
+
+    def test_not_blocked_when_verdict_pass(self, executor):
+        text = "| 아키텍처 | ✅ |\n비고: ❌ 항목 없음\n\nVERDICT: PASS"
+        with patch("subprocess.run", side_effect=[_claude_result(text), _claude_result("버그 의심")]):
+            assert executor._run_reviews() is False
+
+    def test_blocked_when_verdict_fail(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("| 테스트 | ❌ |\nVERDICT: FAIL"), _claude_result("")]):
+            assert executor._run_reviews() is True
+
+    def test_blocked_when_verdict_missing(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("| 테스트 | ✅ |"), _claude_result("")]):
+            assert executor._run_reviews() is True
+
+    def test_last_verdict_line_wins(self, executor):
+        text = "예시: VERDICT: FAIL\n...\nVERDICT: PASS\n"
+        with patch("subprocess.run", side_effect=[_claude_result(text), _claude_result("")]):
+            assert executor._run_reviews() is False
+
+    def test_blocked_when_review_fails_to_run(self, executor):
+        with patch("subprocess.run", side_effect=[_claude_result("", returncode=1), _claude_result("")]):
+            assert executor._run_reviews() is True
+
+    def test_blocked_when_review_output_not_json(self, executor):
+        bad = MagicMock(returncode=0, stdout="not json", stderr="")
+        with patch("subprocess.run", side_effect=[bad, _claude_result("")]):
+            assert executor._run_reviews() is True
+
+
+class TestFinalizeReview:
+    def _prepare(self, executor, top_index, *, review, push):
+        executor._auto_review = review
+        executor._auto_push = push
+        executor._phase_name = "mvp"
+        git_calls = []
+
+        def fake_git(*args):
+            git_calls.append(args)
+            # diff --cached --quiet: 1이면 커밋할 변경이 있다
+            return MagicMock(returncode=1 if args[:1] == ("diff",) else 0, stdout="", stderr="")
+
+        executor._run_git = fake_git
+        return git_calls
+
+    def test_no_review_by_default(self, executor, top_index):
+        self._prepare(executor, top_index, review=False, push=False)
+        with patch.object(executor, "_run_reviews") as runs:
+            executor._finalize()
+        runs.assert_not_called()
+
+    def test_runs_reviews_after_phase_commit_and_commits_outputs(self, executor, top_index):
+        git_calls = self._prepare(executor, top_index, review=True, push=False)
+        order = []
+        with patch.object(executor, "_run_reviews", side_effect=lambda: order.append(len(git_calls)) or False):
+            executor._finalize()
+        commits = [c for c in git_calls if c[0] == "commit"]
+        assert commits[0][-1] == "chore(mvp): mark phase completed"
+        assert commits[-1][-1] == "chore(mvp): review output"
+        # 리뷰는 phase 완료 커밋 뒤에 돈다
+        first_commit_idx = git_calls.index(commits[0])
+        assert order[0] > first_commit_idx
+
+    def test_pushes_when_not_blocked(self, executor, top_index):
+        git_calls = self._prepare(executor, top_index, review=True, push=True)
+        with patch.object(executor, "_run_reviews", return_value=False):
+            executor._finalize()
+        assert any(c[0] == "push" for c in git_calls)
+
+    def test_skips_push_and_exits_when_blocked(self, executor, top_index):
+        git_calls = self._prepare(executor, top_index, review=True, push=True)
+        with patch.object(executor, "_run_reviews", return_value=True):
+            with pytest.raises(SystemExit) as exc_info:
+                executor._finalize()
+        assert exc_info.value.code == 1
+        assert not any(c[0] == "push" for c in git_calls)
+
+
+class TestMainCliReview:
+    def test_review_flag_passed_to_executor(self):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--review", "--push"]):
+            with patch.object(ex, "StepExecutor") as cls:
+                ex.main()
+        cls.assert_called_once_with("0-mvp", auto_push=True, auto_review=True)
+
+    def test_review_off_by_default(self):
+        with patch("sys.argv", ["execute.py", "0-mvp"]):
+            with patch.object(ex, "StepExecutor") as cls:
+                ex.main()
+        cls.assert_called_once_with("0-mvp", auto_push=False, auto_review=False)

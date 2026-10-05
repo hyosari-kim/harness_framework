@@ -143,6 +143,7 @@ npm test        # 테스트 통과
 ```bash
 python3 scripts/execute.py {task-name}        # 순차 실행
 python3 scripts/execute.py {task-name} --push  # 실행 후 push
+python3 scripts/execute.py {task-name} --review --push  # 실행 → /review → /logic-review → (규칙 위반 없으면) push
 ```
 
 execute.py가 자동으로 처리하는 것:
@@ -153,6 +154,7 @@ execute.py가 자동으로 처리하는 것:
 - 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
 - 2단계 커밋 — 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
+- 리뷰(`--review`일 때) — phase 완료 커밋 뒤 `/review`(규칙 위반)와 `/logic-review`(로직 버그)를 차례로 실행해 `phases/{task-name}/review-output.json`, `logic-review-output.json`에 남기고 `chore` 커밋한다. `/review`가 실패하거나 마지막 `VERDICT:` 줄이 `PASS`가 아니면 push하지 않고 종료 코드 1로 멈춘다. `/logic-review` 지적은 push를 막지 않으니 직접 읽고 판단한다. 내장 `/code-review`는 `claude -p`에서 리뷰를 하지 않아 쓰지 않는다.
 
 에러 복구:
 

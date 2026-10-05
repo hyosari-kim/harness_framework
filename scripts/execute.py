@@ -3,7 +3,10 @@
 Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
 Usage:
-    python3 scripts/execute.py <phase-dir> [--push]
+    python3 scripts/execute.py <phase-dir> [--push] [--review]
+
+--review: phase 완료 뒤 /review(규칙 위반) → /logic-review(로직 버그)를 실행해
+phases/<phase-dir>/{review,logic-review}-output.json에 남긴다. /review의 마지막 `VERDICT:` 줄이 PASS가 아니면 push하지 않는다.
 """
 
 import argparse
@@ -56,15 +59,18 @@ class StepExecutor:
     MAX_RETRIES = 3
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
+    # (출력 파일 이름, 프롬프트). /code-review는 claude -p에서 리뷰를 하지 않아 프로젝트 커맨드를 쓴다.
+    REVIEWS = (("review", "/review"), ("logic-review", "/logic-review"))
     TZ = timezone(timedelta(hours=9))
 
-    def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
+    def __init__(self, phase_dir_name: str, *, auto_push: bool = False, auto_review: bool = False):
         self._root = str(ROOT)
         self._phases_dir = ROOT / "phases"
         self._phase_dir = self._phases_dir / phase_dir_name
         self._phase_dir_name = phase_dir_name
         self._top_index_file = self._phases_dir / "index.json"
         self._auto_push = auto_push
+        self._auto_review = auto_review
 
         if not self._phase_dir.is_dir():
             print(f"ERROR: {self._phase_dir} not found")
@@ -256,6 +262,43 @@ class StepExecutor:
 
         return output
 
+    # --- 리뷰 ---
+
+    def _run_reviews(self) -> bool:
+        """리뷰를 차례로 실행해 결과를 남기고, push를 막아야 하면 True를 돌려준다.
+
+        막는 기준은 /review뿐이다: 실행 실패, 결과를 읽을 수 없음, 마지막 `VERDICT:` 줄이 PASS가 아님(없음 포함).
+        결과 본문의 ❌는 설명 문장에도 나올 수 있어 판정에 쓰지 않는다.
+        /logic-review의 지적은 확실하지 않은 것이 섞여 있어 사람이 보고 판단한다.
+        """
+        blocked = False
+        for name, prompt in self.REVIEWS:
+            with progress_indicator(f"{prompt} 실행 중"):
+                result = subprocess.run(
+                    ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+                    cwd=self._root, capture_output=True, text=True, timeout=1800,
+                )
+            try:
+                text = json.loads(result.stdout).get("result")
+            except (json.JSONDecodeError, AttributeError):
+                text = None
+            out_path = self._phase_dir / f"{name}-output.json"
+            self._write_json(out_path, {
+                "command": prompt, "exitCode": result.returncode,
+                "result": text, "stderr": result.stderr,
+            })
+            print(f"  ✓ {prompt} → {out_path.relative_to(self._root)}")
+            if name == "review" and (result.returncode != 0 or self._verdict(text) != "PASS"):
+                blocked = True
+        return blocked
+
+    @staticmethod
+    def _verdict(text: Optional[str]) -> Optional[str]:
+        if not isinstance(text, str):
+            return None
+        lines = [l.strip() for l in text.splitlines() if l.strip().startswith("VERDICT:")]
+        return lines[-1].removeprefix("VERDICT:").strip() if lines else None
+
     # --- 헤더 & 검증 ---
 
     def _print_header(self):
@@ -391,6 +434,15 @@ class StepExecutor:
             if r.returncode == 0:
                 print(f"  ✓ {msg}")
 
+        if self._auto_review:
+            blocked = self._run_reviews()
+            self._run_git("add", "-A")
+            if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+                self._run_git("commit", "-m", f"chore({self._phase_name}): review output")
+            if blocked and self._auto_push:
+                print("\n  ERROR: /review가 PASS가 아니어서 push하지 않았습니다. review-output.json을 확인하세요.")
+                sys.exit(1)
+
         if self._auto_push:
             branch = f"feat-{self._phase_name}"
             r = self._run_git("push", "-u", "origin", branch)
@@ -408,9 +460,10 @@ def main():
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    parser.add_argument("--review", action="store_true", help="Run /review and /logic-review after completion")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, auto_push=args.push).run()
+    StepExecutor(args.phase_dir, auto_push=args.push, auto_review=args.review).run()
 
 
 if __name__ == "__main__":
