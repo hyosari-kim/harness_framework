@@ -61,6 +61,9 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    # step 세션(테스트·구현) 모델. step 문서는 Sonnet이 문서만 보고 같은 코드를 쓸 수 있게 작성한다(doc-reviewer 기준).
+    # 고정하지 않으면 Claude Code 기본 모델이 바뀔 때 결과와 비용이 모르게 달라진다.
+    STEP_MODEL = "sonnet"
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TEST_MSG = "test({phase}): step {num} — {name}"
@@ -302,7 +305,8 @@ class StepExecutor:
 
         prompt = preamble + step_file.read_text()
         result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+            ["claude", "-p", "--dangerously-skip-permissions", "--model", self.STEP_MODEL,
+             "--output-format", "json", prompt],
             cwd=self._root, capture_output=True, text=True, timeout=1800,
         )
 

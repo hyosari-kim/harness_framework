@@ -440,6 +440,16 @@ class TestInvokeClaude:
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
 
+    def test_step_sessions_run_on_sonnet(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._invoke_claude({"step": 2, "name": "ui"}, "preamble")
+            executor._invoke_claude({"step": 2, "name": "ui"}, "preamble", output_name="step2-test-output.json")
+
+        for call in mock_run.call_args_list:
+            cmd = call[0][0]
+            assert cmd[cmd.index("--model") + 1] == "sonnet"
+
     def test_saves_output_json(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
         step = {"step": 2, "name": "ui"}
