@@ -780,9 +780,9 @@ class TestWriteTests:
         preamble = inv.call_args[0][1]
         assert "GUARD" in preamble
         assert "테스트만" in preamble
-        assert "커밋하지 마라" in preamble
+        assert "status 갱신·커밋은 따르지 마라" in preamble
         # 테스트 세션은 `## 작업`의 시그니처·로직을 근거로 쓰고, `## 테스트` 절로 보충한다
-        assert "`## 작업`의 시그니처·로직·핵심 규칙마다" in preamble
+        assert "`## 작업`의 시그니처·로직이 말한 동작" in preamble
         assert "`## 테스트`" in preamble
         assert "tests.md" not in preamble
 
