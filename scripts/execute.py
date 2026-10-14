@@ -5,6 +5,9 @@ Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한
 Usage:
     python3 scripts/execute.py <phase-dir> [--push] [--review]
 
+각 step은 테스트 세션(테스트만 써서 test 커밋) → 구현 세션(테스트를 고치지 않고 구현) 순으로 돈다.
+index.json에서 `"tests": false`인 step은 테스트 세션을 건너뛴다.
+
 --review: phase 완료 뒤 /review(규칙 위반) → /logic-review(로직 버그)를 실행해
 phases/<phase-dir>/{review,logic-review}-output.json에 남긴다. /review의 마지막 `VERDICT:` 줄이 PASS가 아니면 push하지 않는다.
 """
@@ -13,6 +16,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -57,8 +61,17 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    # step 세션 모델. 고정하지 않으면 Claude Code 기본 모델이 바뀔 때 결과와 비용이 모르게 달라진다.
+    # 구현 세션: step 문서는 Sonnet이 문서만 보고 같은 코드를 쓸 수 있게 작성한다(doc-reviewer 기준).
+    # 테스트 세션: 테스트 전략에서 케이스를 정하고 빠뜨리지 않아야 해서 Opus로 돌린다.
+    STEP_MODEL = "sonnet"
+    TEST_MODEL = "opus"
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
+    TEST_MSG = "test({phase}): step {num} — {name}"
+    # 구현 세션이 테스트를 건너뛸 때 skipped_tests 항목마다 채워야 하는 필드
+    SKIP_FIELDS = ("test", "step_doc", "test_expects", "reason")
+    SKIP_RE = re.compile(r"\b(it|test|describe)\.skip\(")
     # (출력 파일 이름, 프롬프트). /code-review는 claude -p에서 리뷰를 하지 않아 프로젝트 커맨드를 쓴다.
     REVIEWS = (("review", "/review"), ("logic-review", "/logic-review"))
     # 리뷰 세션은 권한 확인을 끄지 않는다. 쓸 수 있는 도구를 읽기와 Bash로 줄이고(--tools),
@@ -211,21 +224,63 @@ class StepExecutor:
             return ""
         return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
 
+    @staticmethod
+    def _retry_section(prev_error: Optional[str]) -> str:
+        if not prev_error:
+            return ""
+        return (
+            f"\n## ⚠ 이전 시도 실패 — 아래 에러를 반드시 참고하여 수정하라\n\n"
+            f"{prev_error}\n\n---\n\n"
+        )
+
+    def _build_test_preamble(self, guardrails: str, step_context: str,
+                             prev_error: Optional[str] = None) -> str:
+        return (
+            f"당신은 {self._project} 프로젝트의 테스트 작성자입니다. 아래 step의 테스트만 쓰세요. "
+            f"구현은 다음 세션이 이 테스트를 보고 합니다.\n\n"
+            f"{guardrails}\n\n---\n\n"
+            f"{step_context}{self._retry_section(prev_error)}"
+            f"## 작업 규칙\n\n"
+            f"1. 아래 step 문서 `## 작업`의 시그니처·로직이 말한 동작을 확인하는 테스트를 써라. 구현을 짐작해 맞추지 마라.\n"
+            f"   `## 테스트` 절의 전략·추가 확인·테스트 파일 변경을 빠짐없이 반영하고, 단언하지 않는 것은 단언하지 마라.\n"
+            f"2. 테스트 파일(`*.test.ts(x)`, `test/` 아래)만 바꾼다.\n"
+            f"3. step 문서의 AC·검증 절차·status 갱신·커밋은 따르지 마라. 구현 세션과 하네스가 한다.\n"
+            f"4. 사용자 개입이 필요하면 /phases/{self._phase_dir_name}/index.json 해당 step에 "
+            f"\"blocked\" + \"blocked_reason\"만 적고 중단하라.\n\n---\n\n"
+        )
+
+    def _tests_section(self, tests_commit: Optional[str]) -> str:
+        if not tests_commit:
+            return ""
+        fields = "\n".join([
+            "  - `test`: `파일 › 테스트 이름`",
+            "  - `step_doc`: 근거가 된 step 문서 문장(절)",
+            "  - `test_expects`: 테스트가 기대하는 것",
+            "  - `reason`: 둘이 어떻게 다르고, 왜 문서 쪽이 맞다고 보는지",
+        ])
+        return (
+            f"## 이 step의 테스트\n\n"
+            f"테스트는 별도 세션이 step 문서의 `## 테스트` 절대로 먼저 써서 커밋했다"
+            f"(`{tests_commit}`, `git show --stat {tests_commit}`로 확인). 이 테스트가 통과하도록 구현하라.\n"
+            f"- 그 테스트 파일을 고치거나 지우지 마라. 새 테스트 파일은 추가해도 된다.\n"
+            f"- 기존 테스트 파일을 바꾸거나 지워야 구현할 수 있는데 그 일이 `## 테스트` 절에 없거나 테스트 세션이 빠뜨렸으면, "
+            f"고치지 말고 index.json 해당 step에 \"blocked\" + \"blocked_reason\"(어느 파일을 왜 바꿔야 하는지)을 적고 즉시 중단하라.\n"
+            f"- 테스트가 step 문서와 다르다고 판단될 때만 그 테스트를 `it.skip`/`test.skip`/`describe.skip`으로 바꾸고 "
+            f"나머지 작업을 계속하라. 그리고 index.json 해당 step의 `skipped_tests` 배열에 건너뛴 테스트마다 아래를 모두 적어라:\n"
+            f"{fields}\n"
+            f"- 구현이 어렵거나 실패를 고치지 못했다는 이유로 건너뛰지 마라. 그런 경우는 error로 기록한다.\n"
+            f"- 건너뛴 테스트는 phase가 끝날 때 한꺼번에 사용자에게 보고된다.\n\n---\n\n"
+        )
+
     def _build_preamble(self, guardrails: str, step_context: str,
-                        prev_error: Optional[str] = None) -> str:
+                        prev_error: Optional[str] = None, tests_commit: Optional[str] = None) -> str:
         commit_example = self.FEAT_MSG.format(
             phase=self._phase_name, num="N", name="<step-name>"
         )
-        retry_section = ""
-        if prev_error:
-            retry_section = (
-                f"\n## ⚠ 이전 시도 실패 — 아래 에러를 반드시 참고하여 수정하라\n\n"
-                f"{prev_error}\n\n---\n\n"
-            )
         return (
             f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
             f"{guardrails}\n\n---\n\n"
-            f"{step_context}{retry_section}"
+            f"{step_context}{self._retry_section(prev_error)}{self._tests_section(tests_commit)}"
             f"## 작업 규칙\n\n"
             f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
@@ -241,7 +296,8 @@ class StepExecutor:
 
     # --- Claude 호출 ---
 
-    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+    def _invoke_claude(self, step: dict, preamble: str, output_name: Optional[str] = None,
+                       model: Optional[str] = None) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -251,7 +307,8 @@ class StepExecutor:
 
         prompt = preamble + step_file.read_text()
         result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+            ["claude", "-p", "--dangerously-skip-permissions", "--model", model or self.STEP_MODEL,
+             "--output-format", "json", prompt],
             cwd=self._root, capture_output=True, text=True, timeout=1800,
         )
 
@@ -265,7 +322,7 @@ class StepExecutor:
             "exitCode": result.returncode,
             "stdout": result.stdout, "stderr": result.stderr,
         }
-        out_path = self._phase_dir / f"step{step_num}-output.json"
+        out_path = self._phase_dir / (output_name or f"step{step_num}-output.json")
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
@@ -345,18 +402,142 @@ class StepExecutor:
             index["created_at"] = self._stamp()
             self._write_json(self._index_file, index)
 
+    # --- 테스트 세션 ---
+
+    @staticmethod
+    def _is_test_file(path: str) -> bool:
+        return path.startswith("test/") or re.search(r"\.test\.[jt]sx?$", path) is not None
+
+    def _head(self) -> str:
+        return self._run_git("rev-parse", "HEAD").stdout.strip()
+
+    def _changed_files(self, since: str) -> list:
+        """since 커밋 이후 바뀐 파일(커밋·작업 트리·추적 안 된 새 파일). phases/ 메타데이터는 뺀다."""
+        diff = self._run_git("diff", "--name-only", since).stdout.splitlines()
+        new = self._run_git("ls-files", "--others", "--exclude-standard").stdout.splitlines()
+        return sorted({f for f in diff + new if f and not f.startswith("phases/")})
+
+    def _exit_blocked(self, index: dict, step_num: int, step_name: str, elapsed: int):
+        for s in index["steps"]:
+            if s["step"] == step_num:
+                s["blocked_at"] = self._stamp()
+        self._write_json(self._index_file, index)
+        reason = next((s.get("blocked_reason", "") for s in index["steps"] if s["step"] == step_num), "")
+        print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
+        print(f"    Reason: {reason}")
+        self._update_top_index("blocked")
+        sys.exit(2)
+
+    def _exit_error(self, index: dict, step_num: int, step_name: str, err_msg: str, elapsed: int):
+        for s in index["steps"]:
+            if s["step"] == step_num:
+                s["status"] = "error"
+                s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
+                s["failed_at"] = self._stamp()
+        self._write_json(self._index_file, index)
+        self._commit_step(step_num, step_name)
+        print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
+        print(f"    Error: {err_msg}")
+        self._update_top_index("error")
+        sys.exit(1)
+
+    def _write_tests(self, step: dict, guardrails: str):
+        """테스트 세션: 테스트 파일만 쓰게 하고, 하네스가 그 파일만 test 커밋한 뒤 tests_commit에 기록한다."""
+        step_num, step_name = step["step"], step["name"]
+        prev_error = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            start = self._head()
+            index = self._read_json(self._index_file)
+            preamble = self._build_test_preamble(guardrails, self._build_step_context(index), prev_error)
+
+            tag = f"Step {step_num}/{self._total - 1}: {step_name} [tests]"
+            if attempt > 1:
+                tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
+            with progress_indicator(tag) as pi:
+                self._invoke_claude(step, preamble, output_name=f"step{step_num}-test-output.json", model=self.TEST_MODEL)
+                elapsed = int(pi.elapsed)
+
+            index = self._read_json(self._index_file)
+            status = next((s.get("status") for s in index["steps"] if s["step"] == step_num), "pending")
+            if status == "blocked":
+                self._exit_blocked(index, step_num, step_name, elapsed)
+
+            changed = self._changed_files(start)
+            others = [f for f in changed if not self._is_test_file(f)]
+            if others:
+                err_msg = f"테스트 파일이 아닌 파일을 바꿨다: {', '.join(others)}. 되돌리고 테스트 파일만 써라."
+            elif not changed:
+                err_msg = "테스트 파일을 쓰지 않았다."
+            else:
+                self._run_git("add", "-A", "--", *changed)
+                self._run_git("commit", "-m", self.TEST_MSG.format(phase=self._phase_name, num=step_num, name=step_name))
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "pending"
+                        s["tests_commit"] = self._head()
+                self._write_json(self._index_file, index)
+                print(f"  ✓ Step {step_num}: {step_name} tests [{elapsed}s]")
+                return
+
+            if attempt < self.MAX_RETRIES:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "pending"
+                        s.pop("error_message", None)
+                self._write_json(self._index_file, index)
+                prev_error = err_msg
+                print(f"  ↻ Step {step_num}: tests retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
+            else:
+                self._exit_error(index, step_num, step_name, err_msg, elapsed)
+
+    def _check_tests(self, step: dict) -> Optional[str]:
+        """구현 세션이 테스트 세션의 테스트를 `.skip` 말고는 바꾸지 않았고, 건너뛴 테스트를 빠짐없이 적었는지 본다.
+
+        문제가 있으면 구현 세션에 다시 줄 메시지를, 없으면 None을 돌려준다.
+        """
+        sha = step["tests_commit"]
+        skipped_any = False
+        for path in self._changed_files(sha):
+            if not self._is_test_file(path):
+                continue
+            original = self._run_git("show", f"{sha}:{path}")
+            if original.returncode != 0:
+                continue  # 구현 세션이 새로 만든 테스트 파일
+            current_file = Path(self._root) / path
+            if not current_file.exists():
+                return f"테스트 파일 {path}를 지웠다. 되돌려라: git checkout {sha} -- {path}"
+            current = current_file.read_text(encoding="utf-8")
+            if self.SKIP_RE.sub(r"\1(", current) != self.SKIP_RE.sub(r"\1(", original.stdout):
+                return (f"테스트 파일 {path}를 `.skip` 말고 다르게 바꿨다. "
+                        f"되돌리고(git checkout {sha} -- {path}) 구현을 고쳐라.")
+            skipped_any = skipped_any or current != original.stdout
+
+        skipped = step.get("skipped_tests") or []
+        if skipped_any and not skipped:
+            return "테스트를 `.skip`으로 건너뛰었지만 index.json의 skipped_tests에 적지 않았다."
+        for entry in skipped:
+            missing = [k for k in self.SKIP_FIELDS if not (isinstance(entry, dict) and entry.get(k))]
+            if missing:
+                return f"skipped_tests 항목에 {', '.join(missing)}이(가) 비어 있다. 건너뛴 테스트마다 {', '.join(self.SKIP_FIELDS)}를 모두 적어라."
+        return None
+
     # --- 실행 루프 ---
 
     def _execute_single_step(self, step: dict, guardrails: str) -> bool:
-        """단일 step 실행 (재시도 포함). 완료되면 True, 실패/차단이면 False."""
+        """단일 step 실행 (테스트 세션 → 구현 세션, 재시도 포함). 완료되면 True, 실패/차단이면 False."""
         step_num, step_name = step["step"], step["name"]
+        if step.get("tests", True) and not step.get("tests_commit"):
+            self._write_tests(step, guardrails)
+        tests_commit = next(s for s in self._read_json(self._index_file)["steps"] if s["step"] == step_num).get("tests_commit")
+
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
         prev_error = None
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
             step_context = self._build_step_context(index)
-            preamble = self._build_preamble(guardrails, step_context, prev_error)
+            preamble = self._build_preamble(guardrails, step_context, prev_error, tests_commit)
 
             tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
             if attempt > 1:
@@ -367,56 +548,45 @@ class StepExecutor:
                 elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
-            status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
-            ts = self._stamp()
+            current = next((s for s in index["steps"] if s["step"] == step_num), {})
+            status = current.get("status", "pending")
 
             if status == "completed":
-                for s in index["steps"]:
-                    if s["step"] == step_num:
-                        s["completed_at"] = ts
-                self._write_json(self._index_file, index)
-                self._commit_step(step_num, step_name)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
-                return True
-
-            if status == "blocked":
-                for s in index["steps"]:
-                    if s["step"] == step_num:
-                        s["blocked_at"] = ts
-                self._write_json(self._index_file, index)
-                reason = next((s.get("blocked_reason", "") for s in index["steps"] if s["step"] == step_num), "")
-                print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
-                print(f"    Reason: {reason}")
-                self._update_top_index("blocked")
-                sys.exit(2)
-
-            err_msg = next(
-                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
-                "Step did not update status",
-            )
+                err_msg = self._check_tests(current) if tests_commit else None
+                if err_msg is None:
+                    current["completed_at"] = self._stamp()
+                    self._write_json(self._index_file, index)
+                    self._commit_step(step_num, step_name)
+                    print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                    return True
+            elif status == "blocked":
+                self._exit_blocked(index, step_num, step_name, elapsed)
+            else:
+                err_msg = current.get("error_message", "Step did not update status")
 
             if attempt < self.MAX_RETRIES:
-                for s in index["steps"]:
-                    if s["step"] == step_num:
-                        s["status"] = "pending"
-                        s.pop("error_message", None)
+                current["status"] = "pending"
+                current.pop("error_message", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
                 print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
             else:
-                for s in index["steps"]:
-                    if s["step"] == step_num:
-                        s["status"] = "error"
-                        s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
-                        s["failed_at"] = ts
-                self._write_json(self._index_file, index)
-                self._commit_step(step_num, step_name)
-                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
-                print(f"    Error: {err_msg}")
-                self._update_top_index("error")
-                sys.exit(1)
+                self._exit_error(index, step_num, step_name, err_msg, elapsed)
 
         return False  # unreachable
+
+    def _report_skipped(self):
+        """구현 세션이 step 문서와 다르다고 보고 건너뛴 테스트를 phase 끝에 한꺼번에 보여 준다."""
+        index = self._read_json(self._index_file)
+        rows = [(s, e) for s in index["steps"] for e in s.get("skipped_tests") or []]
+        if not rows:
+            return
+        print(f"\n  ⚠ 구현 세션이 건너뛴 테스트 {len(rows)}개 (step 문서와 다르다고 판단):")
+        for s, e in rows:
+            print(f"    - Step {s['step']} ({s['name']}): {e.get('test')}")
+            print(f"      step 문서: {e.get('step_doc')}")
+            print(f"      테스트 기대: {e.get('test_expects')}")
+            print(f"      이유: {e.get('reason')}")
 
     def _execute_all_steps(self, guardrails: str):
         while True:
@@ -447,6 +617,8 @@ class StepExecutor:
             r = self._run_git("commit", "-m", msg)
             if r.returncode == 0:
                 print(f"  ✓ {msg}")
+
+        self._report_skipped()
 
         if self._auto_review:
             blocked = self._run_reviews()

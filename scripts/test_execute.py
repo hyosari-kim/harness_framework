@@ -440,6 +440,13 @@ class TestInvokeClaude:
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
 
+    def test_implementation_session_runs_on_sonnet(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._invoke_claude({"step": 2, "name": "ui"}, "preamble")
+        cmd = mock_run.call_args[0][0]
+        assert cmd[cmd.index("--model") + 1] == "sonnet"
+
     def test_saves_output_json(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
         step = {"step": 2, "name": "ui"}
@@ -695,3 +702,296 @@ class TestMainCliReview:
             with patch.object(ex, "StepExecutor") as cls:
                 ex.main()
         cls.assert_called_once_with("0-mvp", auto_push=False, auto_review=False)
+
+
+# ---------------------------------------------------------------------------
+# step을 테스트 세션 → 구현 세션으로 나눠 실행
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def git_executor(executor, tmp_project):
+    """tmp_project를 실제 git 저장소로 만든 executor (테스트 파일 커밋·대조 확인용)."""
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_project, check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_project / "src").mkdir()
+    (tmp_project / "src" / "a.ts").write_text("export const a = 1;\n")
+    (tmp_project / "src" / "a.test.ts").write_text("it('a', () => {});\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "init")
+    return executor
+
+
+def _head(root):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+
+
+def _step(executor, num=2):
+    return next(s for s in executor._read_json(executor._index_file)["steps"] if s["step"] == num)
+
+
+def _update_step(executor, num=2, **fields):
+    index = executor._read_json(executor._index_file)
+    for s in index["steps"]:
+        if s["step"] == num:
+            s.update(fields)
+    executor._write_json(executor._index_file, index)
+
+
+class TestIsTestFile:
+    @pytest.mark.parametrize("path", ["src/a.test.ts", "src/x/B.test.tsx", "test/screens/a.test.tsx", "test/sqliteTestDb.ts"])
+    def test_test_files(self, path):
+        assert ex.StepExecutor._is_test_file(path)
+
+    @pytest.mark.parametrize("path", ["src/a.ts", "src/test.ts", "docs/ADR.md", "src/a.testing.ts"])
+    def test_non_test_files(self, path):
+        assert not ex.StepExecutor._is_test_file(path)
+
+
+class TestWriteTests:
+    def test_commits_only_test_files_and_records_commit(self, git_executor, tmp_project):
+        def session(step, preamble, output_name=None, model=None):
+            (tmp_project / "src" / "b.test.ts").write_text("it('b', () => {});\n")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session) as inv:
+            git_executor._write_tests({"step": 2, "name": "ui"}, "GUARD")
+
+        assert inv.call_args[1]["output_name"] == "step2-test-output.json"
+        log = subprocess.run(["git", "log", "-1", "--format=%s", "--name-only"], cwd=tmp_project,
+                             capture_output=True, text=True).stdout.split()
+        assert " ".join(log[:5]) == "test(mvp): step 2 — ui"
+        assert log[5:] == ["src/b.test.ts"]
+        s = _step(git_executor)
+        assert s["tests_commit"] == _head(tmp_project)
+        assert s["status"] == "pending"
+
+    def test_preamble_limits_session_to_tests(self, git_executor, tmp_project):
+        def session(step, preamble, output_name=None, model=None):
+            (tmp_project / "src" / "b.test.ts").write_text("x")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session) as inv:
+            git_executor._write_tests({"step": 2, "name": "ui"}, "GUARD")
+
+        assert inv.call_args[1]["model"] == "opus"
+        preamble = inv.call_args[0][1]
+        assert "GUARD" in preamble
+        assert "테스트만" in preamble
+        assert "status 갱신·커밋은 따르지 마라" in preamble
+        # 테스트 세션은 `## 작업`의 시그니처·로직을 근거로 쓰고, `## 테스트` 절로 보충한다
+        assert "`## 작업`의 시그니처·로직이 말한 동작" in preamble
+        assert "`## 테스트`" in preamble
+        assert "tests.md" not in preamble
+
+    def test_retries_when_non_test_file_changed(self, git_executor, tmp_project):
+        calls = []
+
+        def session(step, preamble, output_name=None, model=None):
+            calls.append(preamble)
+            if len(calls) == 1:
+                (tmp_project / "src" / "a.ts").write_text("export const a = 2;\n")
+            else:
+                (tmp_project / "src" / "a.ts").write_text("export const a = 1;\n")
+                (tmp_project / "src" / "b.test.ts").write_text("x")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session):
+            git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert len(calls) == 2
+        assert "src/a.ts" in calls[1]
+        assert _step(git_executor)["tests_commit"] == _head(tmp_project)
+
+    def test_retries_when_no_test_written(self, git_executor, tmp_project):
+        calls = []
+
+        def session(step, preamble, output_name=None, model=None):
+            calls.append(preamble)
+            if len(calls) == 2:
+                (tmp_project / "src" / "b.test.ts").write_text("x")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session):
+            git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert len(calls) == 2
+        assert "테스트 파일을 쓰지 않았" in calls[1]
+
+    def test_error_after_max_retries(self, git_executor, tmp_project, top_index):
+        with patch.object(git_executor, "_invoke_claude", return_value={}):
+            with pytest.raises(SystemExit) as exc_info:
+                git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert exc_info.value.code == 1
+        s = _step(git_executor)
+        assert s["status"] == "error"
+        assert "테스트 파일을 쓰지 않았" in s["error_message"]
+        assert "tests_commit" not in s
+
+    def test_blocked_exits(self, git_executor, top_index):
+        def session(step, preamble, output_name=None, model=None):
+            _update_step(git_executor, status="blocked", blocked_reason="API 키 필요")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session):
+            with pytest.raises(SystemExit) as exc_info:
+                git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert exc_info.value.code == 2
+        assert "blocked_at" in _step(git_executor)
+
+
+SKIP_ENTRY = {
+    "test": "src/a.test.ts › a",
+    "step_doc": "step2 §1: 빈 값이면 null을 돌려준다",
+    "test_expects": "빈 값이면 던진다",
+    "reason": "step 문서는 null을 돌려준다고 정했는데 테스트는 예외를 기대한다",
+}
+
+
+class TestCheckTests:
+    @pytest.fixture
+    def sha(self, git_executor, tmp_project):
+        return _head(tmp_project)
+
+    def _check(self, executor, sha, skipped=None):
+        s = {"step": 2, "tests_commit": sha}
+        if skipped is not None:
+            s["skipped_tests"] = skipped
+        return executor._check_tests(s)
+
+    def test_ok_when_tests_untouched(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.ts").write_text("export const a = 3;\n")
+        assert self._check(git_executor, sha) is None
+
+    def test_ok_when_skipped_with_full_entry(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.test.ts").write_text("it.skip('a', () => {});\n")
+        assert self._check(git_executor, sha, [SKIP_ENTRY]) is None
+
+    def test_ok_when_new_test_file_added(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "c.test.ts").write_text("it('c', () => {});\n")
+        assert self._check(git_executor, sha) is None
+
+    def test_fails_when_skip_not_reported(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.test.ts").write_text("it.skip('a', () => {});\n")
+        assert "skipped_tests" in self._check(git_executor, sha)
+
+    @pytest.mark.parametrize("missing", ["test", "step_doc", "test_expects", "reason"])
+    def test_fails_when_entry_field_missing(self, git_executor, tmp_project, sha, missing):
+        (tmp_project / "src" / "a.test.ts").write_text("it.skip('a', () => {});\n")
+        entry = {**SKIP_ENTRY, missing: ""}
+        assert missing in self._check(git_executor, sha, [entry])
+
+    def test_fails_when_test_changed_otherwise(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.test.ts").write_text("it('a', () => { expect(1).toBe(1); });\n")
+        problem = self._check(git_executor, sha)
+        assert "src/a.test.ts" in problem
+        assert sha in problem
+
+    def test_fails_when_test_deleted(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.test.ts").unlink()
+        assert "src/a.test.ts" in self._check(git_executor, sha)
+
+    def test_sees_committed_changes(self, git_executor, tmp_project, sha):
+        (tmp_project / "src" / "a.test.ts").write_text("it('a', () => { throw 1; });\n")
+        subprocess.run(["git", "commit", "-qam", "feat"], cwd=tmp_project, check=True)
+        assert "src/a.test.ts" in self._check(git_executor, sha)
+
+
+class TestImplPreamble:
+    def test_mentions_test_commit_and_skip_rules(self, executor):
+        p = executor._build_preamble("", "", tests_commit="abc123")
+        assert "abc123" in p
+        assert ".skip" in p
+        for field in ("test", "step_doc", "test_expects", "reason"):
+            assert f"`{field}`" in p
+
+    def test_points_to_test_section_and_blocked_path(self, executor):
+        p = executor._build_preamble("", "", tests_commit="abc123")
+        section = p.split("## 이 step의 테스트")[1]
+        assert "`## 테스트`" in section
+        assert "tests.md" not in p
+        assert "blocked" in section
+
+    def test_no_test_section_without_test_commit(self, executor):
+        p = executor._build_preamble("", "")
+        assert "skipped_tests" not in p
+
+
+class TestExecuteSingleStepSplit:
+    def _run(self, executor, step, *, check=None, impl=None):
+        sessions = []
+
+        def write_tests(st, guardrails):
+            sessions.append("tests")
+            _update_step(executor, tests_commit="sha1")
+
+        def invoke(st, preamble, output_name=None, model=None):
+            sessions.append("impl")
+            (impl or (lambda: _update_step(executor, status="completed", summary="done")))()
+            return {}
+
+        with patch.object(executor, "_write_tests", side_effect=write_tests), \
+             patch.object(executor, "_invoke_claude", side_effect=invoke), \
+             patch.object(executor, "_check_tests", side_effect=check or (lambda s: None)), \
+             patch.object(executor, "_commit_step"):
+            result = executor._execute_single_step(step, "")
+        return sessions, result
+
+    def test_writes_tests_then_implements(self, executor):
+        sessions, result = self._run(executor, _step(executor))
+        assert sessions == ["tests", "impl"]
+        assert result is True
+
+    def test_skips_test_session_when_tests_false(self, executor):
+        _update_step(executor, tests=False)
+        sessions, _ = self._run(executor, _step(executor))
+        assert sessions == ["impl"]
+
+    def test_skips_test_session_when_already_committed(self, executor):
+        _update_step(executor, tests_commit="sha0")
+        sessions, _ = self._run(executor, _step(executor))
+        assert sessions == ["impl"]
+
+    def test_retries_impl_when_tests_tampered(self, executor):
+        problems = iter(["테스트 파일 src/a.test.ts를 바꿨다", None])
+        prompts = []
+        orig = executor._build_preamble
+
+        def spy(*a, **k):
+            prompts.append(orig(*a, **k))
+            return prompts[-1]
+
+        with patch.object(executor, "_build_preamble", side_effect=spy):
+            sessions, result = self._run(executor, _step(executor), check=lambda s: next(problems))
+
+        assert sessions == ["tests", "impl", "impl"]
+        assert "src/a.test.ts를 바꿨다" in prompts[1]
+        assert result is True
+        assert _step(executor)["status"] == "completed"
+
+
+class TestReportSkipped:
+    def test_prints_all_skipped_tests(self, executor, capsys):
+        _update_step(executor, num=1, skipped_tests=[SKIP_ENTRY])
+        _update_step(executor, num=2, skipped_tests=[{**SKIP_ENTRY, "test": "src/b.test.ts › b"}])
+        executor._report_skipped()
+        out = capsys.readouterr().out
+        assert "2개" in out
+        assert "Step 1 (core): src/a.test.ts › a" in out
+        assert "Step 2 (ui): src/b.test.ts › b" in out
+        for value in ("step2 §1: 빈 값이면 null을 돌려준다", "빈 값이면 던진다", "테스트는 예외를 기대한다"):
+            assert value in out
+
+    def test_silent_when_none(self, executor, capsys):
+        executor._report_skipped()
+        assert capsys.readouterr().out == ""
+
+    def test_finalize_reports(self, executor, top_index):
+        executor._run_git = lambda *a: MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(executor, "_report_skipped") as report:
+            executor._finalize()
+        report.assert_called_once()

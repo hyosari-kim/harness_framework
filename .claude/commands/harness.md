@@ -70,6 +70,7 @@
 - `steps[].step`: 0부터 시작하는 순번.
 - `steps[].name`: kebab-case slug.
 - `steps[].status`: 초기값은 모두 `"pending"`.
+- `steps[].tests`: 새 동작이 없고 테스트 파일도 바꾸지 않는 step(설정, 문서 등)만 `false`로 적는다. 그러면 테스트 세션 없이 구현 세션만 돈다. 생략하면 테스트 세션이 먼저 돈다. `false`인 step은 step 문서에 `## 테스트` 절을 두지 않는다.
 
 상태 전이와 자동 기록 필드:
 
@@ -78,6 +79,8 @@
 | → `completed` | `completed_at`, `summary` | Claude 세션 (summary), execute.py (timestamp) |
 | → `error` | `failed_at`, `error_message` | Claude 세션 (message), execute.py (timestamp) |
 | → `blocked` | `blocked_at`, `blocked_reason` | Claude 세션 (reason), execute.py (timestamp) |
+
+테스트 세션이 끝나면 execute.py가 `tests_commit`(테스트 커밋 SHA)을 기록한다. 구현 세션이 테스트를 건너뛰면 `skipped_tests`(항목마다 `test`, `step_doc`, `test_expects`, `reason`)를 적는다.
 
 `summary`는 step 완료 시 산출물을 한 줄로 요약한 것으로, execute.py가 다음 step 프롬프트에 컨텍스트로 누적 전달한다. 따라서 다음 step에 유용한 정보(생성된 파일, 핵심 결정 등)를 담아야 한다.
 
@@ -103,6 +106,16 @@
 {구체적인 구현 지시. 파일 경로, 클래스/함수 시그니처, 로직 설명을 포함.
 코드 스니펫은 인터페이스/시그니처 수준만 제시하고, 구현체는 에이전트에게 맡겨라.
 단, 설계 의도에서 벗어나면 안 되는 핵심 규칙은 명확히 박아넣어라.}
+
+## 테스트
+
+{테스트 세션이 구현 세션과 따로 `## 작업`을 근거로 테스트를 먼저 쓴다.
+여기에는 `## 작업`만으로 알 수 없는 것만 적고, 해당 없는 항목은 `없음`으로 쓴다.}
+
+- 전략: {테스트 방법, 도우미·목, 고정 시각}
+- 추가 확인: {`## 작업`에 없지만 꼭 확인할 경우. `상황 → 기대 결과`. `## 작업`에 적힌 동작은 다시 적지 않는다}
+- 테스트 파일 변경: {고치거나 지우거나 옮길 기존 테스트 파일과 옮길 케이스. 빠짐없이}
+- 단언하지 않는 것: {문서가 정하지 않은 동작}
 
 ## Acceptance Criteria
 
@@ -152,11 +165,12 @@ execute.py가 자동으로 처리하는 것:
 - 가드레일 주입 — CLAUDE.md + docs/*.md 내용을 매 step 프롬프트에 포함
 - 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달
 - 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
-- 2단계 커밋 — 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋
-- 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
-- 리뷰(`--review`일 때) — phase 완료 커밋 뒤 `/review`(규칙 위반)와 `/logic-review`(로직 버그)를 차례로 실행해(리뷰 세션은 권한 확인을 끄지 않고 읽기·git 조회·`npm run`만 허용) `phases/{task-name}/review-output.json`, `logic-review-output.json`에 남기고 `chore` 커밋한다. `/review`가 실패하거나 마지막 `VERDICT:` 줄이 `PASS`가 아니면 push하지 않고 종료 코드 1로 멈춘다. `/logic-review` 지적은 push를 막지 않으니 직접 읽고 판단한다. 내장 `/code-review`는 `claude -p`에서 리뷰를 하지 않아 쓰지 않는다.
+- 테스트·구현 세션 분리 — 테스트 세션(opus)이 `## 작업`·`## 테스트`로 테스트를 먼저 쓰고, 구현 세션(sonnet)이 그 테스트를 고치지 않고 구현한다. step 문서는 Sonnet이 문서만 보고 같은 코드를 쓸 수 있게 쓴다. 건너뛴 테스트는 phase가 끝날 때 보고된다. `"tests": false`인 step은 구현 세션만 돈다.
+- 2단계 커밋 — 테스트(`test`), 코드(`feat`), 메타데이터(`chore`)를 나눠 커밋
+- 리뷰(`--review`일 때) — phase 완료 뒤 `/review`(규칙)와 `/logic-review`(로직)를 실행해 `phases/{task-name}/*-output.json`에 남긴다. `/review`가 PASS가 아니면 push하지 않는다.
 
 에러 복구:
 
 - **error 발생 시**: `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
 - **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결한 뒤, `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
+- `## 테스트` 절을 고쳐 테스트를 다시 쓰게 하려면 해당 step의 `tests_commit`을 지우고 재실행한다.
