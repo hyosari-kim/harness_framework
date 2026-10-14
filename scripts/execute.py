@@ -61,9 +61,11 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
-    # step 세션(테스트·구현) 모델. step 문서는 Sonnet이 문서만 보고 같은 코드를 쓸 수 있게 작성한다(doc-reviewer 기준).
-    # 고정하지 않으면 Claude Code 기본 모델이 바뀔 때 결과와 비용이 모르게 달라진다.
+    # step 세션 모델. 고정하지 않으면 Claude Code 기본 모델이 바뀔 때 결과와 비용이 모르게 달라진다.
+    # 구현 세션: step 문서는 Sonnet이 문서만 보고 같은 코드를 쓸 수 있게 작성한다(doc-reviewer 기준).
+    # 테스트 세션: 테스트 전략에서 케이스를 정하고 빠뜨리지 않아야 해서 Opus로 돌린다.
     STEP_MODEL = "sonnet"
+    TEST_MODEL = "opus"
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TEST_MSG = "test({phase}): step {num} — {name}"
@@ -239,10 +241,13 @@ class StepExecutor:
             f"{guardrails}\n\n---\n\n"
             f"{step_context}{self._retry_section(prev_error)}"
             f"## 작업 규칙\n\n"
-            f"1. step 문서의 작업·시그니처·핵심 규칙·테스트할 경우를 테스트로 옮겨라. 테스트 파일"
-            f"(`*.test.ts(x)`, `test/` 아래)만 만들거나 고친다. 구현 파일은 만들지도 고치지도 마라. 이유: 구현은 다음 세션이 한다.\n"
-            f"2. 이전 step의 코드와 테스트를 읽고 같은 도우미·관례를 따르라. 이 step 때문에 기존 테스트나 `test/` 도우미를 "
-            f"바꿔야 하면 여기서 바꾼다. 이유: 구현 세션은 테스트 파일을 고칠 수 없다.\n"
+            f"1. 아래 step 문서 `## 작업`의 시그니처·로직·핵심 규칙마다 문서가 말한 입력→결과를 확인하는 테스트를 써라"
+            f"(정상·경계·오류). 구현이 어떻게 할지 짐작해 맞추지 말고 문서에 적힌 동작만 확인하라. 이유: 같은 문서를 구현 세션과 "
+            f"따로 읽고 테스트하는 것이 이 세션의 목적이다.\n"
+            f"   `## 테스트` 절은 이를 보충한다: 전략을 따르고, 추가 확인과 테스트 파일 변경(수정·삭제·이동)은 한 줄도 빠짐없이 "
+            f"반영하고, 단언하지 않는 것으로 적힌 동작은 단언하지 마라. 테스트 파일 변경에 없는 기존 테스트 파일은 바꾸지 마라.\n"
+            f"2. 테스트 파일(`*.test.ts(x)`, `test/` 아래)만 만들고 고치고 지운다. 구현 파일은 만들지도 고치지도 마라. "
+            f"이유: 구현은 다음 세션이 하고, 구현 세션은 테스트 파일을 고칠 수 없다. 이전 step의 테스트와 같은 도우미·관례를 따르라.\n"
             f"3. 테스트를 실행해 새 테스트가 아직 구현이 없어서 실패하는지 확인하라.\n"
             f"4. step 문서의 AC·검증 절차·status 업데이트는 구현 세션이 한다. 여기서는 따르지 마라.\n"
             f"5. 커밋하지 마라. 하네스가 테스트 파일만 커밋한다.\n"
@@ -257,13 +262,15 @@ class StepExecutor:
             "  - `test`: `파일 › 테스트 이름`",
             "  - `step_doc`: 근거가 된 step 문서 문장(절)",
             "  - `test_expects`: 테스트가 기대하는 것",
-            "  - `reason`: 둘이 어떻게 다르고, 왜 step 문서 쪽이 맞다고 보는지",
+            "  - `reason`: 둘이 어떻게 다르고, 왜 문서 쪽이 맞다고 보는지",
         ])
         return (
             f"## 이 step의 테스트\n\n"
-            f"테스트는 별도 세션이 step 문서만 보고 먼저 써서 커밋했다(`{tests_commit}`, "
-            f"`git show --stat {tests_commit}`로 확인). 이 테스트가 통과하도록 구현하라.\n"
+            f"테스트는 별도 세션이 step 문서의 `## 테스트` 절대로 먼저 써서 커밋했다"
+            f"(`{tests_commit}`, `git show --stat {tests_commit}`로 확인). 이 테스트가 통과하도록 구현하라.\n"
             f"- 그 테스트 파일을 고치거나 지우지 마라. 새 테스트 파일은 추가해도 된다.\n"
+            f"- 기존 테스트 파일을 바꾸거나 지워야 구현할 수 있는데 그 일이 `## 테스트` 절에 없거나 테스트 세션이 빠뜨렸으면, "
+            f"고치지 말고 index.json 해당 step에 \"blocked\" + \"blocked_reason\"(어느 파일을 왜 바꿔야 하는지)을 적고 즉시 중단하라.\n"
             f"- 테스트가 step 문서와 다르다고 판단될 때만 그 테스트를 `it.skip`/`test.skip`/`describe.skip`으로 바꾸고 "
             f"나머지 작업을 계속하라. 그리고 index.json 해당 step의 `skipped_tests` 배열에 건너뛴 테스트마다 아래를 모두 적어라:\n"
             f"{fields}\n"
@@ -295,7 +302,8 @@ class StepExecutor:
 
     # --- Claude 호출 ---
 
-    def _invoke_claude(self, step: dict, preamble: str, output_name: Optional[str] = None) -> dict:
+    def _invoke_claude(self, step: dict, preamble: str, output_name: Optional[str] = None,
+                       model: Optional[str] = None) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -305,7 +313,7 @@ class StepExecutor:
 
         prompt = preamble + step_file.read_text()
         result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--model", self.STEP_MODEL,
+            ["claude", "-p", "--dangerously-skip-permissions", "--model", model or self.STEP_MODEL,
              "--output-format", "json", prompt],
             cwd=self._root, capture_output=True, text=True, timeout=1800,
         )
@@ -453,7 +461,7 @@ class StepExecutor:
             if attempt > 1:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble, output_name=f"step{step_num}-test-output.json")
+                self._invoke_claude(step, preamble, output_name=f"step{step_num}-test-output.json", model=self.TEST_MODEL)
                 elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)

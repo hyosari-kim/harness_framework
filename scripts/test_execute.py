@@ -440,15 +440,12 @@ class TestInvokeClaude:
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
 
-    def test_step_sessions_run_on_sonnet(self, executor):
+    def test_implementation_session_runs_on_sonnet(self, executor):
         mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
         with patch("subprocess.run", return_value=mock_result) as mock_run:
             executor._invoke_claude({"step": 2, "name": "ui"}, "preamble")
-            executor._invoke_claude({"step": 2, "name": "ui"}, "preamble", output_name="step2-test-output.json")
-
-        for call in mock_run.call_args_list:
-            cmd = call[0][0]
-            assert cmd[cmd.index("--model") + 1] == "sonnet"
+        cmd = mock_run.call_args[0][0]
+        assert cmd[cmd.index("--model") + 1] == "sonnet"
 
     def test_saves_output_json(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
@@ -755,7 +752,7 @@ class TestIsTestFile:
 
 class TestWriteTests:
     def test_commits_only_test_files_and_records_commit(self, git_executor, tmp_project):
-        def session(step, preamble, output_name=None):
+        def session(step, preamble, output_name=None, model=None):
             (tmp_project / "src" / "b.test.ts").write_text("it('b', () => {});\n")
             return {}
 
@@ -772,22 +769,27 @@ class TestWriteTests:
         assert s["status"] == "pending"
 
     def test_preamble_limits_session_to_tests(self, git_executor, tmp_project):
-        def session(step, preamble, output_name=None):
+        def session(step, preamble, output_name=None, model=None):
             (tmp_project / "src" / "b.test.ts").write_text("x")
             return {}
 
         with patch.object(git_executor, "_invoke_claude", side_effect=session) as inv:
             git_executor._write_tests({"step": 2, "name": "ui"}, "GUARD")
 
+        assert inv.call_args[1]["model"] == "opus"
         preamble = inv.call_args[0][1]
         assert "GUARD" in preamble
         assert "테스트만" in preamble
         assert "커밋하지 마라" in preamble
+        # 테스트 세션은 `## 작업`의 시그니처·로직을 근거로 쓰고, `## 테스트` 절로 보충한다
+        assert "`## 작업`의 시그니처·로직·핵심 규칙마다" in preamble
+        assert "`## 테스트`" in preamble
+        assert "tests.md" not in preamble
 
     def test_retries_when_non_test_file_changed(self, git_executor, tmp_project):
         calls = []
 
-        def session(step, preamble, output_name=None):
+        def session(step, preamble, output_name=None, model=None):
             calls.append(preamble)
             if len(calls) == 1:
                 (tmp_project / "src" / "a.ts").write_text("export const a = 2;\n")
@@ -806,7 +808,7 @@ class TestWriteTests:
     def test_retries_when_no_test_written(self, git_executor, tmp_project):
         calls = []
 
-        def session(step, preamble, output_name=None):
+        def session(step, preamble, output_name=None, model=None):
             calls.append(preamble)
             if len(calls) == 2:
                 (tmp_project / "src" / "b.test.ts").write_text("x")
@@ -830,7 +832,7 @@ class TestWriteTests:
         assert "tests_commit" not in s
 
     def test_blocked_exits(self, git_executor, top_index):
-        def session(step, preamble, output_name=None):
+        def session(step, preamble, output_name=None, model=None):
             _update_step(git_executor, status="blocked", blocked_reason="API 키 필요")
             return {}
 
@@ -907,6 +909,13 @@ class TestImplPreamble:
         for field in ("test", "step_doc", "test_expects", "reason"):
             assert f"`{field}`" in p
 
+    def test_points_to_test_section_and_blocked_path(self, executor):
+        p = executor._build_preamble("", "", tests_commit="abc123")
+        section = p.split("## 이 step의 테스트")[1]
+        assert "`## 테스트`" in section
+        assert "tests.md" not in p
+        assert "blocked" in section
+
     def test_no_test_section_without_test_commit(self, executor):
         p = executor._build_preamble("", "")
         assert "skipped_tests" not in p
@@ -920,7 +929,7 @@ class TestExecuteSingleStepSplit:
             sessions.append("tests")
             _update_step(executor, tests_commit="sha1")
 
-        def invoke(st, preamble, output_name=None):
+        def invoke(st, preamble, output_name=None, model=None):
             sessions.append("impl")
             (impl or (lambda: _update_step(executor, status="completed", summary="done")))()
             return {}
