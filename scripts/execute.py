@@ -411,11 +411,28 @@ class StepExecutor:
     def _head(self) -> str:
         return self._run_git("rev-parse", "HEAD").stdout.strip()
 
-    def _changed_files(self, since: str) -> list:
-        """since 커밋 이후 바뀐 파일(커밋·작업 트리·추적 안 된 새 파일). phases/ 메타데이터는 뺀다."""
+    def _untracked(self) -> set:
+        return set(self._run_git("ls-files", "--others", "--exclude-standard").stdout.splitlines())
+
+    def _changed_files(self, since: str, ignore: set = frozenset()) -> list:
+        """since 커밋 이후 바뀐 파일(커밋·작업 트리·추적 안 된 새 파일). phases/ 메타데이터와 ignore는 뺀다."""
         diff = self._run_git("diff", "--name-only", since).stdout.splitlines()
-        new = self._run_git("ls-files", "--others", "--exclude-standard").stdout.splitlines()
-        return sorted({f for f in diff + new if f and not f.startswith("phases/")})
+        new = self._untracked() - ignore
+        return sorted({f for f in diff + list(new) if f and not f.startswith("phases/")})
+
+    def _git_or_exit(self, *args):
+        r = self._run_git(*args)
+        if r.returncode != 0:
+            print(f"  ERROR: git {args[0]} 실패: {r.stderr.strip()}")
+            sys.exit(1)
+
+    def _commit_paths(self, paths: list, msg: str):
+        """paths의 추가·수정·삭제를 모두 커밋한다. 이미 `git rm`으로 스테이징된 삭제는 pathspec이 맞지 않으므로 add에서 뺀다."""
+        tracked = set(self._run_git("ls-files", "--", *paths).stdout.splitlines())
+        addable = [f for f in paths if f in tracked or (Path(self._root) / f).exists()]
+        if addable:
+            self._git_or_exit("add", "-A", "--", *addable)
+        self._git_or_exit("commit", "-m", msg)
 
     def _exit_blocked(self, index: dict, step_num: int, step_name: str, elapsed: int):
         for s in index["steps"]:
@@ -445,6 +462,7 @@ class StepExecutor:
         """테스트 세션: 테스트 파일만 쓰게 하고, 하네스가 그 파일만 test 커밋한 뒤 tests_commit에 기록한다."""
         step_num, step_name = step["step"], step["name"]
         prev_error = None
+        untracked_before = self._untracked()  # 사용자가 미리 둔 추적 안 된 파일은 세션 변경으로 보지 않는다
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             start = self._head()
@@ -463,15 +481,14 @@ class StepExecutor:
             if status == "blocked":
                 self._exit_blocked(index, step_num, step_name, elapsed)
 
-            changed = self._changed_files(start)
+            changed = self._changed_files(start, untracked_before)
             others = [f for f in changed if not self._is_test_file(f)]
             if others:
                 err_msg = f"테스트 파일이 아닌 파일을 바꿨다: {', '.join(others)}. 되돌리고 테스트 파일만 써라."
             elif not changed:
                 err_msg = "테스트 파일을 쓰지 않았다."
             else:
-                self._run_git("add", "-A", "--", *changed)
-                self._run_git("commit", "-m", self.TEST_MSG.format(phase=self._phase_name, num=step_num, name=step_name))
+                self._commit_paths(changed, self.TEST_MSG.format(phase=self._phase_name, num=step_num, name=step_name))
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "pending"
