@@ -768,6 +768,62 @@ class TestWriteTests:
         assert s["tests_commit"] == _head(tmp_project)
         assert s["status"] == "pending"
 
+    def test_commits_git_rm_deletions_with_edits_and_new_files(self, git_executor, tmp_project):
+        git = lambda *a: subprocess.run(["git", *a], cwd=tmp_project, check=True, capture_output=True)
+        (tmp_project / "test").mkdir()
+        (tmp_project / "test" / "m.test.ts").write_text("it('m', () => {});\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "m")
+
+        def session(step, preamble, output_name=None, model=None):
+            git("rm", "-q", "src/a.test.ts")
+            (tmp_project / "test" / "m.test.ts").write_text("it('m2', () => {});\n")
+            (tmp_project / "src" / "b.test.ts").write_text("it('b', () => {});\n")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session):
+            git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        files = subprocess.run(["git", "show", "--no-renames", "--format=", "--name-status", "HEAD"], cwd=tmp_project,
+                               capture_output=True, text=True).stdout.splitlines()
+        assert sorted(files) == ["A\tsrc/b.test.ts", "D\tsrc/a.test.ts", "M\ttest/m.test.ts"]
+        status = subprocess.run(["git", "status", "--porcelain", "--", ".", ":!phases"], cwd=tmp_project,
+                                capture_output=True, text=True).stdout
+        assert status == ""
+
+    def test_ignores_untracked_files_present_before_session(self, git_executor, tmp_project):
+        (tmp_project / "assets").mkdir()
+        (tmp_project / "assets" / "x.png").write_text("png")
+
+        def session(step, preamble, output_name=None, model=None):
+            (tmp_project / "src" / "b.test.ts").write_text("x")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session) as inv:
+            git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert inv.call_count == 1
+        files = subprocess.run(["git", "show", "--format=", "--name-only", "HEAD"], cwd=tmp_project,
+                               capture_output=True, text=True).stdout.split()
+        assert files == ["src/b.test.ts"]
+        assert _step(git_executor)["tests_commit"] == _head(tmp_project)
+
+    def test_exits_when_test_commit_fails(self, git_executor, tmp_project):
+        hook = tmp_project / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+
+        def session(step, preamble, output_name=None, model=None):
+            (tmp_project / "src" / "b.test.ts").write_text("x")
+            return {}
+
+        with patch.object(git_executor, "_invoke_claude", side_effect=session):
+            with pytest.raises(SystemExit) as exc_info:
+                git_executor._write_tests({"step": 2, "name": "ui"}, "")
+
+        assert exc_info.value.code == 1
+        assert "tests_commit" not in _step(git_executor)
+
     def test_preamble_limits_session_to_tests(self, git_executor, tmp_project):
         def session(step, preamble, output_name=None, model=None):
             (tmp_project / "src" / "b.test.ts").write_text("x")
